@@ -11,10 +11,17 @@
 (define-constant ERR_CANNOT_ENDORSE_SELF (err u109))
 (define-constant ERR_INSUFFICIENT_ENDORSEMENTS (err u110))
 (define-constant ERR_INSUFFICIENT_COMPLETIONS (err u111))
+(define-constant ERR_MENTORSHIP_NOT_FOUND (err u112))
+(define-constant ERR_ALREADY_ENROLLED (err u113))
+(define-constant ERR_NOT_ENROLLED (err u114))
+(define-constant ERR_PHASE_NOT_COMPLETED (err u115))
+(define-constant ERR_INVALID_PHASE (err u116))
+(define-constant ERR_MENTORSHIP_FULL (err u117))
 
 (define-data-var skill-id-counter uint u0)
 (define-data-var request-id-counter uint u0)
 (define-data-var certification-id-counter uint u0)
+(define-data-var mentorship-id-counter uint u0)
 
 (define-map skills
   { skill-id: uint }
@@ -112,6 +119,78 @@
     status: (string-ascii 20),
     reviewer: (optional principal),
     reviewed-at: (optional uint)
+  }
+)
+
+;; Mentorship program data structures
+(define-map mentorship-programs
+  { mentorship-id: uint }
+  {
+    mentor: principal,
+    skill-category: (string-ascii 50),
+    program-title: (string-ascii 100),
+    description: (string-ascii 400),
+    total-phases: uint,
+    max-mentees: uint,
+    current-mentees: uint,
+    tokens-per-phase: uint,
+    reputation-reward: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+;; Phase definitions for each mentorship program
+(define-map mentorship-phases
+  { mentorship-id: uint, phase-number: uint }
+  {
+    phase-title: (string-ascii 80),
+    phase-description: (string-ascii 300),
+    required-hours: uint,
+    learning-objectives: (string-ascii 200),
+    completion-criteria: (string-ascii 200)
+  }
+)
+
+;; Track mentee enrollment and progress
+(define-map mentorship-enrollments
+  { mentorship-id: uint, mentee: principal }
+  {
+    enrolled-at: uint,
+    current-phase: uint,
+    completed-phases: uint,
+    total-hours-logged: uint,
+    last-activity: uint,
+    status: (string-ascii 20),
+    graduation-date: (optional uint)
+  }
+)
+
+;; Track individual phase completions
+(define-map phase-completions
+  { mentorship-id: uint, mentee: principal, phase-number: uint }
+  {
+    started-at: uint,
+    completed-at: (optional uint),
+    hours-logged: uint,
+    mentor-feedback: (string-ascii 300),
+    mentee-reflection: (string-ascii 300),
+    completion-proof: (string-ascii 200),
+    is-approved: bool
+  }
+)
+
+;; Mentor session tracking
+(define-map mentorship-sessions
+  { mentorship-id: uint, mentee: principal, session-id: uint }
+  {
+    session-date: uint,
+    duration-hours: uint,
+    session-notes: (string-ascii 400),
+    phase-focus: uint,
+    mentor-rating: uint,
+    mentee-rating: uint,
+    recorded-by: principal
   }
 )
 
@@ -533,4 +612,343 @@
 
 (define-private (count-endorsements (item uint) (acc uint))
   acc
+)
+
+;; Mentorship program functions
+
+;; Create a new mentorship program with structured phases
+(define-public (create-mentorship-program
+  (skill-category (string-ascii 50))
+  (program-title (string-ascii 100))
+  (description (string-ascii 400))
+  (total-phases uint)
+  (max-mentees uint)
+  (tokens-per-phase uint)
+  (reputation-reward uint)
+)
+  (let (
+    (mentor-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_AUTHORIZED))
+    (new-mentorship-id (+ (var-get mentorship-id-counter) u1))
+  )
+    ;; Only allow users with sufficient reputation to become mentors
+    (if (>= (get reputation-score mentor-profile) u200)
+      (begin
+        (map-set mentorship-programs
+          { mentorship-id: new-mentorship-id }
+          {
+            mentor: tx-sender,
+            skill-category: skill-category,
+            program-title: program-title,
+            description: description,
+            total-phases: total-phases,
+            max-mentees: max-mentees,
+            current-mentees: u0,
+            tokens-per-phase: tokens-per-phase,
+            reputation-reward: reputation-reward,
+            is-active: true,
+            created-at: stacks-block-height
+          }
+        )
+        (var-set mentorship-id-counter new-mentorship-id)
+        (ok new-mentorship-id)
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Define learning phases for a mentorship program
+(define-public (define-mentorship-phase
+  (mentorship-id uint)
+  (phase-number uint)
+  (phase-title (string-ascii 80))
+  (phase-description (string-ascii 300))
+  (required-hours uint)
+  (learning-objectives (string-ascii 200))
+  (completion-criteria (string-ascii 200))
+)
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+  )
+    (if (is-eq tx-sender (get mentor program))
+      (if (and (>= phase-number u1) (<= phase-number (get total-phases program)))
+        (begin
+          (map-set mentorship-phases
+            { mentorship-id: mentorship-id, phase-number: phase-number }
+            {
+              phase-title: phase-title,
+              phase-description: phase-description,
+              required-hours: required-hours,
+              learning-objectives: learning-objectives,
+              completion-criteria: completion-criteria
+            }
+          )
+          (ok true)
+        )
+        ERR_INVALID_PHASE
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Enroll a mentee in a mentorship program
+(define-public (enroll-in-mentorship (mentorship-id uint))
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+    (mentee-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_AUTHORIZED))
+    (existing-enrollment (map-get? mentorship-enrollments { mentorship-id: mentorship-id, mentee: tx-sender }))
+  )
+    (if (is-some existing-enrollment)
+      ERR_ALREADY_ENROLLED
+      (if (< (get current-mentees program) (get max-mentees program))
+        (if (>= (get skill-tokens mentee-profile) (* (get tokens-per-phase program) (get total-phases program)))
+          (begin
+            ;; Enroll the mentee
+            (map-set mentorship-enrollments
+              { mentorship-id: mentorship-id, mentee: tx-sender }
+              {
+                enrolled-at: stacks-block-height,
+                current-phase: u1,
+                completed-phases: u0,
+                total-hours-logged: u0,
+                last-activity: stacks-block-height,
+                status: "active",
+                graduation-date: none
+              }
+            )
+            ;; Update program mentee count
+            (map-set mentorship-programs
+              { mentorship-id: mentorship-id }
+              (merge program { current-mentees: (+ (get current-mentees program) u1) })
+            )
+            (ok true)
+          )
+          ERR_INSUFFICIENT_BALANCE
+        )
+        ERR_MENTORSHIP_FULL
+      )
+    )
+  )
+)
+
+;; Start a new phase for an enrolled mentee
+(define-public (start-mentorship-phase (mentorship-id uint) (mentee principal) (phase-number uint))
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+    (enrollment (unwrap! (map-get? mentorship-enrollments { mentorship-id: mentorship-id, mentee: mentee }) ERR_NOT_ENROLLED))
+    (existing-phase (map-get? phase-completions { mentorship-id: mentorship-id, mentee: mentee, phase-number: phase-number }))
+  )
+    (if (is-eq tx-sender (get mentor program))
+      (if (and (is-eq (get current-phase enrollment) phase-number) (is-none existing-phase))
+        (begin
+          (map-set phase-completions
+            { mentorship-id: mentorship-id, mentee: mentee, phase-number: phase-number }
+            {
+              started-at: stacks-block-height,
+              completed-at: none,
+              hours-logged: u0,
+              mentor-feedback: "",
+              mentee-reflection: "",
+              completion-proof: "",
+              is-approved: false
+            }
+          )
+          (ok true)
+        )
+        ERR_INVALID_PHASE
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Complete a mentorship phase with feedback and proof
+(define-public (complete-mentorship-phase
+  (mentorship-id uint)
+  (phase-number uint)
+  (hours-logged uint)
+  (mentee-reflection (string-ascii 300))
+  (completion-proof (string-ascii 200))
+)
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+    (enrollment (unwrap! (map-get? mentorship-enrollments { mentorship-id: mentorship-id, mentee: tx-sender }) ERR_NOT_ENROLLED))
+    (phase-completion (unwrap! (map-get? phase-completions { mentorship-id: mentorship-id, mentee: tx-sender, phase-number: phase-number }) ERR_PHASE_NOT_COMPLETED))
+    (mentee-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_AUTHORIZED))
+  )
+    (if (is-eq (get current-phase enrollment) phase-number)
+      (if (is-none (get completed-at phase-completion))
+        (begin
+          ;; Update phase completion details
+          (map-set phase-completions
+            { mentorship-id: mentorship-id, mentee: tx-sender, phase-number: phase-number }
+            (merge phase-completion {
+              completed-at: (some stacks-block-height),
+              hours-logged: hours-logged,
+              mentee-reflection: mentee-reflection,
+              completion-proof: completion-proof
+            })
+          )
+          ;; Update enrollment progress
+          (map-set mentorship-enrollments
+            { mentorship-id: mentorship-id, mentee: tx-sender }
+            (merge enrollment {
+              completed-phases: (+ (get completed-phases enrollment) u1),
+              total-hours-logged: (+ (get total-hours-logged enrollment) hours-logged),
+              last-activity: stacks-block-height
+            })
+          )
+          (ok true)
+        )
+        ERR_ALREADY_EXISTS
+      )
+      ERR_INVALID_PHASE
+    )
+  )
+)
+
+;; Approve phase completion and advance mentee (mentor only)
+(define-public (approve-phase-completion
+  (mentorship-id uint)
+  (mentee principal)
+  (phase-number uint)
+  (mentor-feedback (string-ascii 300))
+)
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+    (enrollment (unwrap! (map-get? mentorship-enrollments { mentorship-id: mentorship-id, mentee: mentee }) ERR_NOT_ENROLLED))
+    (phase-completion (unwrap! (map-get? phase-completions { mentorship-id: mentorship-id, mentee: mentee, phase-number: phase-number }) ERR_PHASE_NOT_COMPLETED))
+    (mentee-profile (unwrap! (map-get? user-profiles { user: mentee }) ERR_NOT_AUTHORIZED))
+    (mentor-profile (unwrap! (map-get? user-profiles { user: tx-sender }) ERR_NOT_AUTHORIZED))
+  )
+    (if (is-eq tx-sender (get mentor program))
+      (if (and (is-some (get completed-at phase-completion)) (not (get is-approved phase-completion)))
+        (begin
+          ;; Approve the phase completion
+          (map-set phase-completions
+            { mentorship-id: mentorship-id, mentee: mentee, phase-number: phase-number }
+            (merge phase-completion {
+              mentor-feedback: mentor-feedback,
+              is-approved: true
+            })
+          )
+          ;; Advance to next phase or graduate
+          (if (< phase-number (get total-phases program))
+            ;; Move to next phase
+            (map-set mentorship-enrollments
+              { mentorship-id: mentorship-id, mentee: mentee }
+              (merge enrollment { current-phase: (+ phase-number u1) })
+            )
+            ;; Graduate mentee
+            (map-set mentorship-enrollments
+              { mentorship-id: mentorship-id, mentee: mentee }
+              (merge enrollment {
+                status: "graduated",
+                graduation-date: (some stacks-block-height)
+              })
+            )
+          )
+          ;; Reward mentee with tokens and reputation
+          (map-set user-profiles
+            { user: mentee }
+            (merge mentee-profile {
+              skill-tokens: (+ (get skill-tokens mentee-profile) (get tokens-per-phase program)),
+              reputation-score: (+ (get reputation-score mentee-profile) u15)
+            })
+          )
+          ;; Reward mentor with reputation
+          (map-set user-profiles
+            { user: tx-sender }
+            (merge mentor-profile {
+              reputation-score: (+ (get reputation-score mentor-profile) (get reputation-reward program))
+            })
+          )
+          (ok true)
+        )
+        ERR_PHASE_NOT_COMPLETED
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Record a mentorship session
+(define-public (record-mentorship-session
+  (mentorship-id uint)
+  (mentee principal)
+  (session-id uint)
+  (duration-hours uint)
+  (session-notes (string-ascii 400))
+  (phase-focus uint)
+  (mentor-rating uint)
+  (mentee-rating uint)
+)
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+    (enrollment (unwrap! (map-get? mentorship-enrollments { mentorship-id: mentorship-id, mentee: mentee }) ERR_NOT_ENROLLED))
+  )
+    (if (or (is-eq tx-sender (get mentor program)) (is-eq tx-sender mentee))
+      (begin
+        (map-set mentorship-sessions
+          { mentorship-id: mentorship-id, mentee: mentee, session-id: session-id }
+          {
+            session-date: stacks-block-height,
+            duration-hours: duration-hours,
+            session-notes: session-notes,
+            phase-focus: phase-focus,
+            mentor-rating: mentor-rating,
+            mentee-rating: mentee-rating,
+            recorded-by: tx-sender
+          }
+        )
+        (ok true)
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Deactivate a mentorship program
+(define-public (deactivate-mentorship-program (mentorship-id uint))
+  (let (
+    (program (unwrap! (map-get? mentorship-programs { mentorship-id: mentorship-id }) ERR_MENTORSHIP_NOT_FOUND))
+  )
+    (if (is-eq tx-sender (get mentor program))
+      (begin
+        (map-set mentorship-programs
+          { mentorship-id: mentorship-id }
+          (merge program { is-active: false })
+        )
+        (ok true)
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Read-only functions for mentorship data retrieval
+
+(define-read-only (get-mentorship-program (mentorship-id uint))
+  (map-get? mentorship-programs { mentorship-id: mentorship-id })
+)
+
+(define-read-only (get-mentorship-phase (mentorship-id uint) (phase-number uint))
+  (map-get? mentorship-phases { mentorship-id: mentorship-id, phase-number: phase-number })
+)
+
+(define-read-only (get-mentorship-enrollment (mentorship-id uint) (mentee principal))
+  (map-get? mentorship-enrollments { mentorship-id: mentorship-id, mentee: mentee })
+)
+
+(define-read-only (get-phase-completion (mentorship-id uint) (mentee principal) (phase-number uint))
+  (map-get? phase-completions { mentorship-id: mentorship-id, mentee: mentee, phase-number: phase-number })
+)
+
+(define-read-only (get-mentorship-session (mentorship-id uint) (mentee principal) (session-id uint))
+  (map-get? mentorship-sessions { mentorship-id: mentorship-id, mentee: mentee, session-id: session-id })
+)
+
+(define-read-only (get-mentorship-counter)
+  (var-get mentorship-id-counter)
 )
